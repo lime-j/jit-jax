@@ -1,0 +1,34 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+
+# Python packaging
+build/
+dist/
+*.egg-info/
+
+# Checkpoints and logs
+jit_jax_ckpts/
+*.ckpt
+*.npz
+*.npy
+*.png
+*.log
+
+# TFDS data
+~/.cache/
+~/.local/share/tensorflow_datasets/
+
+# Editor / OS files
+.DS_Store
+Thumbs.db
+
+# Samples and eval outputs
+samples*/
+jit_jax_samples_*
+
