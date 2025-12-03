@@ -5,7 +5,7 @@ set -euo pipefail
 # Batch size is per device; adjust if you change device count.
 
 TFDS_DATA_DIR="${TFDS_DATA_DIR:-gs://trc-2/}"
-SAVE_DIR="${SAVE_DIR:-./jit_jax_ckpts/jit_l16_imagenet256}"
+SAVE_DIR="${SAVE_DIR:-./jit_jax_ckpts/jit_b16_imagenet256}"
 
 SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -15,7 +15,7 @@ export TFDS_DATA_DIR
 python train.py \
   --model JiT-B/16 \
   --img_size 256 \
-  --batch_size 2 \
+  --batch_size 64 \
   --epochs 200 \
   --warmup_epochs 5 \
   --blr 5e-5 \

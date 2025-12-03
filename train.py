@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from dataclasses import dataclass
 from typing import Callable, Iterable
 
@@ -29,6 +30,17 @@ def shard_prng_key(key: jax.Array) -> jax.Array:
 def sample_t(rng: jax.Array, n: int, p_mean: float, p_std: float) -> jax.Array:
     z = jax.random.normal(rng, (n,)) * p_std + p_mean
     return jax.nn.sigmoid(z)
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    m, s = divmod(seconds, 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}h{m:02d}m{s:02d}s"
+    if m > 0:
+        return f"{m}m{s:02d}s"
+    return f"{s}s"
 
 
 @dataclass
@@ -254,6 +266,7 @@ def train_and_maybe_sample(config: TrainConfig) -> None:
     eff_batch = config.batch_size * jax.device_count()
     steps_per_epoch = config.steps_per_epoch or max(1, DEFAULT_IMAGENET_TRAIN_EXAMPLES // eff_batch)
     val_steps = config.val_steps or max(1, DEFAULT_IMAGENET_VAL_EXAMPLES // eff_batch)
+    total_steps = config.epochs * steps_per_epoch
 
     rng = jax.random.PRNGKey(config.seed)
     rng = jax.random.fold_in(rng, jax.process_index())
@@ -274,6 +287,10 @@ def train_and_maybe_sample(config: TrainConfig) -> None:
     p_train_step = jax.pmap(make_train_step(config), axis_name="batch")
     p_eval_step = jax.pmap(make_eval_step(config), axis_name="batch")
 
+    start_time = time.time()
+    last_log_time = start_time
+    last_log_step = 0
+
     for epoch in range(config.epochs):
         train_loss_acc = 0.0
         train_batches = 0
@@ -284,9 +301,23 @@ def train_and_maybe_sample(config: TrainConfig) -> None:
             batch = next(train_iter)
             state, metrics = p_train_step(state, batch, step_rng)
             if (step + epoch * steps_per_epoch) % config.log_every == 0 and jax.process_index() == 0:
+                now = time.time()
+                step_idx = step + epoch * steps_per_epoch
+                steps_completed = step_idx + 1
+                interval_steps = steps_completed - last_log_step
+                elapsed_interval = max(now - last_log_time, 1e-6)
+                imgs_per_sec = interval_steps * eff_batch / elapsed_interval
+                elapsed_total = now - start_time
+                remaining_steps = max(total_steps - steps_completed, 0)
+                eta = (elapsed_total / steps_completed) * remaining_steps if steps_completed > 0 else 0.0
                 loss_val = float(jax.device_get(metrics["loss"])[0])
                 t_mean = float(jax.device_get(metrics["t_mean"])[0])
-                print(f"step {step + epoch * steps_per_epoch}: loss={loss_val:.4f} t_mean={t_mean:.4f}")
+                print(
+                    f"step {step_idx}: loss={loss_val:.4f} t_mean={t_mean:.4f} "
+                    f"imgs/s={imgs_per_sec:.1f} eta={_format_duration(eta)}"
+                )
+                last_log_time = now
+                last_log_step = steps_completed
             if jax.process_index() == 0:
                 train_loss_acc += float(jax.device_get(metrics["loss"])[0])
                 train_batches += 1
