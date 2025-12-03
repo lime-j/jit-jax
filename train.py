@@ -6,7 +6,7 @@ import argparse
 import os
 import time
 from dataclasses import dataclass
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Optional
 
 import jax
 import jax.numpy as jnp
@@ -26,6 +26,23 @@ DEFAULT_IMAGENET_VAL_EXAMPLES = 50_000
 
 jax.distributed.initialize()
 checkpointer = ocp.StandardCheckpointer()
+WandbRun = Optional["wandb.sdk.wandb_run.Run"]
+
+
+def init_wandb(config: TrainConfig) -> WandbRun:
+    if not config.use_wandb or jax.process_index() != 0:
+        return None
+    try:
+        import wandb
+    except ImportError:
+        print("wandb is not installed; skipping wandb logging.")
+        return None
+    run = wandb.init(
+        project=config.wandb_project,
+        name=config.wandb_run_name,
+        config=vars(config),
+    )
+    return run
 
 
 def shard_prng_key(key: jax.Array) -> jax.Array:
@@ -82,6 +99,9 @@ class TrainConfig:
     resume: str | None = None
     use_flash: bool = True
     val_steps: int | None = None
+    use_wandb: bool = False
+    wandb_project: str = "jit-jax"
+    wandb_run_name: str | None = None
 
 
 class TrainState(train_state.TrainState):
@@ -265,7 +285,7 @@ def save_checkpoint_if_needed(state: TrainState, save_dir: str, step: int) -> No
     os.makedirs(save_dir, exist_ok=True)
     state_to_save = jax.device_get(jax_utils.unreplicate(state))
     ckpt_dir = ocp.utils.get_save_directory(step, save_dir)
-    checkpointer.save(ckpt_dir, args=ocp.args.StandardSave(state_to_save), force=True)
+    checkpointer.save(ckpt_dir, state_to_save)
 
 
 def restore_checkpoint_if_available(state: TrainState, save_dir: str) -> tuple[TrainState, int | None]:
@@ -284,6 +304,7 @@ def train_and_maybe_sample(config: TrainConfig) -> None:
     val_steps = config.val_steps or max(1, DEFAULT_IMAGENET_VAL_EXAMPLES // eff_batch)
     total_steps = config.epochs * steps_per_epoch
     ckpt_dir = config.resume or config.save_dir
+    wandb_run = init_wandb(config)
 
     rng = jax.random.PRNGKey(config.seed)
     rng = jax.random.fold_in(rng, jax.process_index())
@@ -330,6 +351,15 @@ def train_and_maybe_sample(config: TrainConfig) -> None:
                     f"step {step_idx}: loss={loss_val:.4f} t_mean={t_mean:.4f} "
                     f"imgs/s={imgs_per_sec:.1f} eta={_format_duration(eta)}"
                 )
+                if wandb_run:
+                    wandb_run.log(
+                        {
+                            "train/loss": loss_val,
+                            "train/t_mean": t_mean,
+                            "perf/imgs_per_sec": imgs_per_sec,
+                        },
+                        step=steps_completed,
+                    )
                 last_log_time = now
                 last_log_step = steps_completed
             if jax.process_index() == 0:
@@ -357,8 +387,19 @@ def train_and_maybe_sample(config: TrainConfig) -> None:
         if jax.process_index() == 0:
             val_loss_avg = val_loss_acc / max(val_batches, 1)
             print(f"Epoch {epoch}: train_loss={train_loss_avg:.4f} val_loss={val_loss_avg:.4f}")
+            if wandb_run:
+                wandb_run.log(
+                    {
+                        "train/loss_epoch": train_loss_avg,
+                        "val/loss": val_loss_avg,
+                        "epoch": epoch,
+                    },
+                    step=(epoch + 1) * steps_per_epoch,
+                )
 
         save_checkpoint_if_needed(state, ckpt_dir, epoch)
+    if wandb_run:
+        wandb_run.finish()
 
 
 def parse_args() -> TrainConfig:
@@ -400,6 +441,9 @@ def parse_args() -> TrainConfig:
         help="Use TPU flash attention; defaults to on and will error if unavailable.",
     )
     parser.add_argument("--val_steps", type=int, default=None, help="Override validation steps per epoch.")
+    parser.add_argument("--use_wandb", action=argparse.BooleanOptionalAction, default=False, help="Enable wandb logging on host 0.")
+    parser.add_argument("--wandb_project", type=str, default="jit-jax", help="wandb project name.")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="Optional wandb run name.")
     args = parser.parse_args()
     return TrainConfig(**vars(args))
 
