@@ -264,7 +264,7 @@ def make_eval_step(config: TrainConfig) -> Callable:
 def save_checkpoint_if_needed(state: TrainState, save_dir: str, step: int) -> None:
     os.makedirs(save_dir, exist_ok=True)
     state_to_save = jax.device_get(jax_utils.unreplicate(state))
-    ckpt_dir = ocp.utils.get_save_directory(save_dir, step)
+    ckpt_dir = ocp.utils.get_save_directory(step, save_dir)
     checkpointer.save(ckpt_dir, args=ocp.args.StandardSave(state_to_save), force=True)
 
 
@@ -273,7 +273,7 @@ def restore_checkpoint_if_available(state: TrainState, save_dir: str) -> tuple[T
     if not steps:
         return state, None
     latest_step = max(steps)
-    ckpt_dir = ocp.utils.get_save_directory(save_dir, latest_step)
+    ckpt_dir = ocp.utils.get_save_directory(latest_step, save_dir)
     state = checkpointer.restore(ckpt_dir, args=ocp.args.StandardRestore(state))
     return state, latest_step
 
