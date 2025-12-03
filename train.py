@@ -43,6 +43,27 @@ def _orbax_restore_kwargs(target: TrainState):
     return jax.tree_util.tree_map(lambda arr: ocp.RestoreArgs(arr.dtype), target)
 
 
+def maybe_initialize_jax_distributed() -> None:
+    if jax.distributed.is_initialized():
+        return
+    env_process_count = int(os.environ.get("JAX_PROCESS_COUNT", "1"))
+    # Initialize only when multi-process is requested via env vars.
+    if env_process_count <= 1 and "JAX_COORDINATOR_ADDRESS" not in os.environ:
+        return
+    coordinator_address = os.environ.get("JAX_COORDINATOR_ADDRESS")
+    process_id = int(os.environ.get("JAX_PROCESS_INDEX", jax.process_index()))
+    jax.distributed.initialize(
+        coordinator_address=coordinator_address,
+        num_processes=env_process_count,
+        process_id=process_id,
+    )
+    if jax.process_index() == 0:
+        print(
+            f"Initialized JAX distributed: process_id={process_id} / {env_process_count}, "
+            f"coordinator={coordinator_address}"
+        )
+
+
 def shard_prng_key(key: jax.Array) -> jax.Array:
     return jax.random.split(key, jax.local_device_count())
 
@@ -296,6 +317,7 @@ def restore_checkpoint_if_available(state: TrainState, ckpt_manager: ocp.Checkpo
 
 
 def train_and_maybe_sample(config: TrainConfig) -> None:
+    maybe_initialize_jax_distributed()
     eff_batch = config.batch_size * jax.device_count()
     steps_per_epoch = config.steps_per_epoch or max(1, DEFAULT_IMAGENET_TRAIN_EXAMPLES // eff_batch)
     val_steps = config.val_steps or max(1, DEFAULT_IMAGENET_VAL_EXAMPLES // eff_batch)
