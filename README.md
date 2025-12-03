@@ -1,6 +1,6 @@
 # JiT-JAX (Flax + Optax)
 
-A JAX/Flax re-implementation of **JiT** (Just image Transformer) with the same architecture, v-prediction objective, EMA tracking, and sampling schedule as the PyTorch version. It targets TPU training and uses TensorFlow Datasets (TFDS) ImageNet input.
+A JAX/Flax re-implementation of **JiT** (Just image Transformer) with the same architecture, v-prediction objective, EMA tracking, and sampling schedule as the PyTorch version. It targets TPU training and uses TensorFlow Datasets (TFDS) ImageNet input. Still under reconstruction. I'm training it with a TPU-v4 pod.
 
 ## Highlights
 - Flax/Linen model matches the PyTorch blocks: rotary attention, AdaLN modulation, in-context tokens, and zero-initialized output/ada layers.
@@ -47,3 +47,7 @@ python -m jit_jax.train \
 | JiT-B/16 | (paper) / (paper) | training in progress |
 | JiT-L/16 | (paper) / (paper) | training in progress |
 | JiT-H/16 | (paper) / (paper) | training in progress |
+
+## Acknowledgement
+
+We would like to express the deepest gratitude to Google TPU Research Cloud (TRC) for granting us access to TPUs.
