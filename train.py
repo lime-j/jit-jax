@@ -23,6 +23,9 @@ from jit_jax.model import JiT_models
 DEFAULT_IMAGENET_TRAIN_EXAMPLES = 1_281_167  # ImageNet-1k train split size.
 DEFAULT_IMAGENET_VAL_EXAMPLES = 50_000
 
+# Initialize distributed at import time so Orbax barriers always have a client.
+jax.distributed.initialize()
+
 
 def create_checkpoint_manager(save_dir: str) -> ocp.CheckpointManager:
     options = ocp.CheckpointManagerOptions(
@@ -41,27 +44,6 @@ def _orbax_save_kwargs(target: TrainState):
 
 def _orbax_restore_kwargs(target: TrainState):
     return jax.tree_util.tree_map(lambda arr: ocp.RestoreArgs(arr.dtype), target)
-
-
-def maybe_initialize_jax_distributed() -> None:
-    if jax.distributed.is_initialized():
-        return
-    num_processes = int(os.environ.get("JAX_PROCESS_COUNT", jax.process_count()))
-    if num_processes <= 1:
-        return
-    default_port = os.environ.get("JAX_COORDINATOR_PORT", "12345")
-    coordinator_address = os.environ.get("JAX_COORDINATOR_ADDRESS", f"localhost:{default_port}")
-    process_id = int(os.environ.get("JAX_PROCESS_INDEX", jax.process_index()))
-    jax.distributed.initialize(
-        coordinator_address=coordinator_address,
-        num_processes=num_processes,
-        process_id=process_id,
-    )
-    if jax.process_index() == 0:
-        print(
-            f"Initialized JAX distributed: process_id={process_id} / {num_processes}, "
-            f"coordinator={coordinator_address}"
-        )
 
 
 def shard_prng_key(key: jax.Array) -> jax.Array:
@@ -317,7 +299,6 @@ def restore_checkpoint_if_available(state: TrainState, ckpt_manager: ocp.Checkpo
 
 
 def train_and_maybe_sample(config: TrainConfig) -> None:
-    maybe_initialize_jax_distributed()
     eff_batch = config.batch_size * jax.device_count()
     steps_per_epoch = config.steps_per_epoch or max(1, DEFAULT_IMAGENET_TRAIN_EXAMPLES // eff_batch)
     val_steps = config.val_steps or max(1, DEFAULT_IMAGENET_VAL_EXAMPLES // eff_batch)
