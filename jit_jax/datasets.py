@@ -73,8 +73,9 @@ class DataPipeline:
         process_index = jax.process_index()
         process_count = jax.process_count()
 
-        # Evenly shard the split across hosts to avoid overlap.
-        split_spec = f"{split}[{process_index}/{process_count}]"
+        # Evenly shard the split across hosts to avoid overlap using TFDS helpers.
+        split_shards = tfds.even_splits(split, n=process_count)
+        split_spec = split_shards[process_index]
 
         train = split == "train"
         ds = tfds.load("imagenet2012", split=split_spec)

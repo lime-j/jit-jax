@@ -10,8 +10,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from jit_jax.flash_attention_stub import tpu_flash_attention, tpu_flash_available
-
 
 def rotate_half(x: jnp.ndarray) -> jnp.ndarray:
     x1, x2 = jnp.split(x, 2, axis=-1)
@@ -180,26 +178,11 @@ class Attention(nn.Module):
         q = rope(q)
         k = rope(k)
 
-        rng = self.make_rng("dropout") if not deterministic else None
-        if self.use_flash and not tpu_flash_available:
-            raise RuntimeError("Flash attention requested but TPU flash kernel is unavailable in this JAX build.")
-
-        if self.use_flash:
-            out = tpu_flash_attention.flash_attention(
-                q,
-                k,
-                v,
-                dropout_rng=rng,
-                dropout_rate=self.attn_drop if not deterministic else 0.0,
-                causal=False,
-                softmax_scale=1.0 / math.sqrt(head_dim),
-            )
-        else:
-            scale = 1.0 / math.sqrt(head_dim)
-            attn_logits = jnp.einsum("bhqd,bhkd->bhqk", q.astype(jnp.float32), k.astype(jnp.float32)) * scale
-            attn = nn.softmax(attn_logits, axis=-1)
-            attn = nn.Dropout(rate=self.attn_drop)(attn, deterministic=deterministic)
-            out = jnp.einsum("bhqk,bhkd->bhqd", attn, v)
+        scale = 1.0 / math.sqrt(head_dim)
+        attn_logits = jnp.einsum("bhqd,bhkd->bhqk", q.astype(jnp.float32), k.astype(jnp.float32)) * scale
+        attn = nn.softmax(attn_logits, axis=-1)
+        attn = nn.Dropout(rate=self.attn_drop)(attn, deterministic=deterministic)
+        out = jnp.einsum("bhqk,bhkd->bhqd", attn, v)
         out = out.transpose(0, 2, 1, 3).reshape(x.shape[0], x.shape[1], self.dim)
 
         out = nn.Dense(self.dim, kernel_init=nn.initializers.xavier_uniform())(out)
@@ -256,6 +239,7 @@ class JiTBlock(nn.Module):
     mlp_ratio: float = 4.0
     attn_drop: float = 0.0
     proj_drop: float = 0.0
+    use_flash: bool = True
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, c: jnp.ndarray, rope: VisionRotaryEmbeddingFast, deterministic: bool) -> jnp.ndarray:
@@ -277,6 +261,7 @@ class JiTBlock(nn.Module):
             qk_norm=True,
             attn_drop=self.attn_drop,
             proj_drop=self.proj_drop,
+            use_flash=self.use_flash,
         )(modulate(RMSNorm(self.hidden_size, eps=1e-6)(x), shift_msa, scale_msa), rope=rope, deterministic=deterministic)
 
         mlp_hidden_dim = int(self.hidden_size * self.mlp_ratio)

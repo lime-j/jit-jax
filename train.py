@@ -81,19 +81,19 @@ def make_lr_schedule(config: TrainConfig, steps_per_epoch: int) -> Callable[[int
     min_lr = config.min_lr
 
     def schedule(step: int) -> float:
-        step = jnp.asarray(step)
-        lr = base_lr
-        if step < warmup_steps:
-            lr = base_lr * (step / warmup_steps)
+        step = jnp.asarray(step, dtype=jnp.float32)
+        warmup = jnp.asarray(warmup_steps, dtype=jnp.float32)
+        total = jnp.asarray(total_steps, dtype=jnp.float32)
+
+        if config.lr_schedule == "cosine":
+            progress = (step - warmup) / jnp.maximum(total - warmup, 1.0)
+            cosine_lr = min_lr + (base_lr - min_lr) * 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
+            lr = jnp.where(warmup > 0, jnp.where(step < warmup, base_lr * (step / warmup), cosine_lr), cosine_lr)
+        elif config.lr_schedule == "constant":
+            lr = jnp.where(warmup > 0, jnp.where(step < warmup, base_lr * (step / warmup), base_lr), base_lr)
         else:
-            if config.lr_schedule == "cosine":
-                progress = (step - warmup_steps) / jnp.maximum(total_steps - warmup_steps, 1)
-                lr = min_lr + (base_lr - min_lr) * 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
-            elif config.lr_schedule == "constant":
-                lr = base_lr
-            else:
-                raise ValueError(f"Unknown lr_schedule {config.lr_schedule}")
-        return float(lr)
+            raise ValueError(f"Unknown lr_schedule {config.lr_schedule}")
+        return lr
 
     return schedule
 
