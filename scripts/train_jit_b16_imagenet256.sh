@@ -15,7 +15,7 @@ export TFDS_DATA_DIR
 python train.py \
   --model JiT-B/16 \
   --img_size 256 \
-  --batch_size 64 \
+  --batch_size 128 \
   --epochs 200 \
   --warmup_epochs 5 \
   --blr 5e-5 \
