@@ -259,7 +259,10 @@ def make_eval_step(config: TrainConfig) -> Callable:
 def save_checkpoint_if_needed(state: TrainState, save_dir: str, step: int) -> None:
     os.makedirs(save_dir, exist_ok=True)
     state_to_save = jax.device_get(jax_utils.unreplicate(state))
-    checkpoints.save_checkpoint(save_dir, state_to_save, step=step, overwrite=True)
+    if jax.process_count() > 1:
+        checkpoints.save_checkpoint_multiprocess(save_dir, state_to_save, step=step, overwrite=True)
+    else:
+        checkpoints.save_checkpoint(save_dir, state_to_save, step=step, overwrite=True)
 
 
 def train_and_maybe_sample(config: TrainConfig) -> None:
@@ -344,8 +347,7 @@ def train_and_maybe_sample(config: TrainConfig) -> None:
             val_loss_avg = val_loss_acc / max(val_batches, 1)
             print(f"Epoch {epoch}: train_loss={train_loss_avg:.4f} val_loss={val_loss_avg:.4f}")
 
-        if jax.process_index() == 0:
-            save_checkpoint_if_needed(state, config.save_dir, epoch)
+        save_checkpoint_if_needed(state, config.save_dir, epoch)
 
 
 def parse_args() -> TrainConfig:
