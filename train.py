@@ -23,27 +23,9 @@ from jit_jax.model import JiT_models
 DEFAULT_IMAGENET_TRAIN_EXAMPLES = 1_281_167  # ImageNet-1k train split size.
 DEFAULT_IMAGENET_VAL_EXAMPLES = 50_000
 
-# Initialize distributed at import time so Orbax barriers always have a client.
+
 jax.distributed.initialize()
-
-
-def create_checkpoint_manager(save_dir: str) -> ocp.CheckpointManager:
-    options = ocp.CheckpointManagerOptions(
-        max_to_keep=3,
-        create=True,
-        enable_async_checkpointing=False,
-        multiprocessing_options=ocp.checkpoint_manager.MultiprocessingOptions(primary_host=0),
-    )
-    checkpointer = ocp.Checkpointer(ocp.PyTreeCheckpointHandler())
-    return ocp.CheckpointManager(save_dir, checkpointer, options=options)
-
-
-def _orbax_save_kwargs(target: TrainState):
-    return jax.tree_util.tree_map(lambda _: ocp.SaveArgs(), target)
-
-
-def _orbax_restore_kwargs(target: TrainState):
-    return jax.tree_util.tree_map(lambda arr: ocp.RestoreArgs(arr.dtype), target)
+checkpointer = ocp.StandardCheckpointer()
 
 
 def shard_prng_key(key: jax.Array) -> jax.Array:
@@ -279,22 +261,20 @@ def make_eval_step(config: TrainConfig) -> Callable:
     return eval_step
 
 
-def save_checkpoint_if_needed(state: TrainState, ckpt_manager: ocp.CheckpointManager, step: int) -> None:
-    if jax.process_index() == 0:
-        os.makedirs(ckpt_manager.directory, exist_ok=True)
-        state_to_save = jax.device_get(jax_utils.unreplicate(state))
-        save_kwargs = _orbax_save_kwargs(state_to_save)
-        ckpt_manager.save(step, items=state_to_save, save_kwargs=save_kwargs, force=True)
-    ocp.multihost.sync_global_processes("jit_jax:checkpoint_saved")
+def save_checkpoint_if_needed(state: TrainState, save_dir: str, step: int) -> None:
+    os.makedirs(save_dir, exist_ok=True)
+    state_to_save = jax.device_get(jax_utils.unreplicate(state))
+    ckpt_dir = ocp.utils.get_save_directory(save_dir, step)
+    checkpointer.save(ckpt_dir, args=ocp.args.StandardSave(state_to_save), force=True)
 
 
-def restore_checkpoint_if_available(state: TrainState, ckpt_manager: ocp.CheckpointManager) -> tuple[TrainState, int | None]:
-    latest_step = ckpt_manager.latest_step()
-    if latest_step is None:
+def restore_checkpoint_if_available(state: TrainState, save_dir: str) -> tuple[TrainState, int | None]:
+    steps = ocp.utils.checkpoint_steps(save_dir)
+    if not steps:
         return state, None
-    restore_kwargs = _orbax_restore_kwargs(state)
-    state = ckpt_manager.restore(latest_step, items=state, restore_kwargs=restore_kwargs)
-    ocp.multihost.sync_global_processes("jit_jax:checkpoint_restored")
+    latest_step = max(steps)
+    ckpt_dir = ocp.utils.get_save_directory(save_dir, latest_step)
+    state = checkpointer.restore(ckpt_dir, args=ocp.args.StandardRestore(state))
     return state, latest_step
 
 
@@ -304,13 +284,12 @@ def train_and_maybe_sample(config: TrainConfig) -> None:
     val_steps = config.val_steps or max(1, DEFAULT_IMAGENET_VAL_EXAMPLES // eff_batch)
     total_steps = config.epochs * steps_per_epoch
     ckpt_dir = config.resume or config.save_dir
-    ckpt_manager = create_checkpoint_manager(ckpt_dir)
 
     rng = jax.random.PRNGKey(config.seed)
     rng = jax.random.fold_in(rng, jax.process_index())
     rng, init_rng = jax.random.split(rng)
     state = create_state(init_rng, config, steps_per_epoch)
-    state, restored_step = restore_checkpoint_if_available(state, ckpt_manager)
+    state, restored_step = restore_checkpoint_if_available(state, ckpt_dir)
     if restored_step is not None and jax.process_index() == 0:
         print(f"Restored checkpoint step {restored_step} from {ckpt_dir}")
     state = jax_utils.replicate(state)
@@ -379,7 +358,7 @@ def train_and_maybe_sample(config: TrainConfig) -> None:
             val_loss_avg = val_loss_acc / max(val_batches, 1)
             print(f"Epoch {epoch}: train_loss={train_loss_avg:.4f} val_loss={val_loss_avg:.4f}")
 
-        save_checkpoint_if_needed(state, ckpt_manager, epoch)
+        save_checkpoint_if_needed(state, ckpt_dir, epoch)
 
 
 def parse_args() -> TrainConfig:
