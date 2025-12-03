@@ -46,20 +46,20 @@ def _orbax_restore_kwargs(target: TrainState):
 def maybe_initialize_jax_distributed() -> None:
     if jax.distributed.is_initialized():
         return
-    env_process_count = int(os.environ.get("JAX_PROCESS_COUNT", "1"))
-    # Initialize only when multi-process is requested via env vars.
-    if env_process_count <= 1 and "JAX_COORDINATOR_ADDRESS" not in os.environ:
+    num_processes = int(os.environ.get("JAX_PROCESS_COUNT", jax.process_count()))
+    if num_processes <= 1:
         return
-    coordinator_address = os.environ.get("JAX_COORDINATOR_ADDRESS")
+    default_port = os.environ.get("JAX_COORDINATOR_PORT", "12345")
+    coordinator_address = os.environ.get("JAX_COORDINATOR_ADDRESS", f"localhost:{default_port}")
     process_id = int(os.environ.get("JAX_PROCESS_INDEX", jax.process_index()))
     jax.distributed.initialize(
         coordinator_address=coordinator_address,
-        num_processes=env_process_count,
+        num_processes=num_processes,
         process_id=process_id,
     )
     if jax.process_index() == 0:
         print(
-            f"Initialized JAX distributed: process_id={process_id} / {env_process_count}, "
+            f"Initialized JAX distributed: process_id={process_id} / {num_processes}, "
             f"coordinator={coordinator_address}"
         )
 
