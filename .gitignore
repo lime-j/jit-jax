@@ -19,7 +19,7 @@ jit_jax_ckpts/
 *.npy
 *.png
 *.log
-
+wandb
 # TFDS data
 ~/.cache/
 ~/.local/share/tensorflow_datasets/

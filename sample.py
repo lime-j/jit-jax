@@ -15,7 +15,7 @@ from flax import jax_utils
 from flax.training import checkpoints
 from PIL import Image
 
-from jit_jax.train import TrainConfig, TrainState, create_state, make_sampler, shard_prng_key
+from train import TrainConfig, TrainState, create_state, make_sampler, shard_prng_key
 
 
 def save_images(images: np.ndarray, start_idx: int, out_dir: Path) -> None:
@@ -31,6 +31,7 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=str, required=True, help="Checkpoint directory or file.")
     parser.add_argument("--output_dir", type=str, default="./samples", help="Where to write PNG samples.")
     parser.add_argument("--model", type=str, default="JiT-B/16")
+    parser.add_argument("--model_backend", type=str, default="jax", choices=["jax", "torchax"])
     parser.add_argument("--img_size", type=int, default=256)
     parser.add_argument("--class_num", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=128, help="Per-device batch size for sampling.")
@@ -42,12 +43,6 @@ def main() -> None:
     parser.add_argument("--interval_max", type=float, default=1.0)
     parser.add_argument("--noise_scale", type=float, default=1.0)
     parser.add_argument("--params_key", type=str, default="ema1", choices=["ema1", "ema2", "params"])
-    parser.add_argument(
-        "--use_flash",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use TPU flash attention; defaults to on and will error if unavailable.",
-    )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -61,6 +56,7 @@ def main() -> None:
 
     config = TrainConfig(
         model=args.model,
+        model_backend=args.model_backend,
         img_size=args.img_size,
         batch_size=per_device,
         sampling_method=args.sampling_method,
@@ -70,7 +66,6 @@ def main() -> None:
         interval_max=args.interval_max,
         noise_scale=args.noise_scale,
         class_num=args.class_num,
-        use_flash=args.use_flash,
     )
 
     rng = jax.random.PRNGKey(args.seed)
@@ -78,7 +73,16 @@ def main() -> None:
     rng, init_rng = jax.random.split(rng)
 
     state = create_state(init_rng, config, steps_per_epoch=1)
-    ckpt_path = checkpoints.latest_checkpoint(args.checkpoint) or args.checkpoint
+    ckpt_path = checkpoints.latest_checkpoint(args.checkpoint)
+    if ckpt_path is None:
+        last_dir = Path(args.checkpoint) / "last"
+        best_dir = Path(args.checkpoint) / "best"
+        if last_dir.is_dir():
+            ckpt_path = str(last_dir)
+        elif best_dir.is_dir():
+            ckpt_path = str(best_dir)
+        else:
+            ckpt_path = args.checkpoint
     state = checkpoints.restore_checkpoint(ckpt_path, target=state)
     state = jax_utils.replicate(state)
 

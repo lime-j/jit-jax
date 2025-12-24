@@ -44,6 +44,7 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=str, required=True, help="Checkpoint directory or file.")
     parser.add_argument("--fid_stats", type=str, required=True, help="Path to fid_stats npz (same as PyTorch).")
     parser.add_argument("--model", type=str, default="JiT-B/16")
+    parser.add_argument("--model_backend", type=str, default="jax", choices=["jax", "torchax"])
     parser.add_argument("--img_size", type=int, default=256)
     parser.add_argument("--class_num", type=int, default=1000)
     parser.add_argument("--batch_size", type=int, default=128, help="Per-device batch size for sampling.")
@@ -76,6 +77,7 @@ def main() -> None:
 
     config = TrainConfig(
         model=args.model,
+        model_backend=args.model_backend,
         img_size=args.img_size,
         batch_size=per_device,
         sampling_method=args.sampling_method,
@@ -93,7 +95,16 @@ def main() -> None:
     rng, init_rng = jax.random.split(rng)
 
     state = create_state(init_rng, config, steps_per_epoch=1)
-    ckpt_path = checkpoints.latest_checkpoint(args.checkpoint) or args.checkpoint
+    ckpt_path = checkpoints.latest_checkpoint(args.checkpoint)
+    if ckpt_path is None:
+        last_dir = Path(args.checkpoint) / "last"
+        best_dir = Path(args.checkpoint) / "best"
+        if last_dir.is_dir():
+            ckpt_path = str(last_dir)
+        elif best_dir.is_dir():
+            ckpt_path = str(best_dir)
+        else:
+            ckpt_path = args.checkpoint
     state = checkpoints.restore_checkpoint(ckpt_path, target=state)
     state = jax_utils.replicate(state)
 

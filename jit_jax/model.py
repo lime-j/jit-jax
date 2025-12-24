@@ -17,40 +17,51 @@ def rotate_half(x: jnp.ndarray) -> jnp.ndarray:
 
 
 class VisionRotaryEmbeddingFast(nn.Module):
+    """Port of JiT's VisionRotaryEmbeddingFast (util/model_util.py) to JAX."""
+
     dim: int
     pt_seq_len: int = 16
     ft_seq_len: Optional[int] = None
+    custom_freqs: Optional[jnp.ndarray] = None
+    freqs_for: str = "lang"
     theta: float = 10000.0
     max_freq: float = 10.0
-    freqs_for: str = "lang"
+    num_freqs: int = 1
     num_cls_token: int = 0
 
     def setup(self) -> None:
         ft_seq_len = self.ft_seq_len or self.pt_seq_len
-        if self.freqs_for == "lang":
-            freqs = 1.0 / (self.theta ** (jnp.arange(0, self.dim, 2) / self.dim))
+
+        if self.custom_freqs is not None:
+            freqs = jnp.asarray(self.custom_freqs)
+        elif self.freqs_for == "lang":
+            freqs = 1.0 / (self.theta ** (jnp.arange(0, self.dim, 2)[: (self.dim // 2)] / self.dim))
         elif self.freqs_for == "pixel":
             freqs = jnp.linspace(1.0, self.max_freq / 2, self.dim // 2) * math.pi
+        elif self.freqs_for == "constant":
+            freqs = jnp.ones(self.num_freqs, dtype=jnp.float32)
         else:
-            raise ValueError(f"Unsupported freqs_for={self.freqs_for}")
+            raise ValueError(f"unknown modality {self.freqs_for}")
 
-        t = jnp.arange(ft_seq_len) / ft_seq_len * self.pt_seq_len
-        freqs_single = jnp.einsum("n,f->nf", t, freqs)
-        freqs_single = jnp.repeat(freqs_single, repeats=2, axis=-1)
+        t = jnp.arange(ft_seq_len, dtype=jnp.float32) / ft_seq_len * self.pt_seq_len
+        freqs = jnp.einsum("n,f->nf", t, freqs)
+        freqs = jnp.repeat(freqs, repeats=2, axis=-1)
 
-        freqs_h = jnp.broadcast_to(freqs_single[:, None, :], (ft_seq_len, ft_seq_len, freqs_single.shape[-1]))
-        freqs_w = jnp.broadcast_to(freqs_single[None, :, :], (ft_seq_len, ft_seq_len, freqs_single.shape[-1]))
-        freqs = jnp.concatenate([freqs_h, freqs_w], axis=-1)
-        freqs = freqs.reshape(-1, freqs.shape[-1])
+        freqs_h = jnp.broadcast_to(freqs[:, None, :], (ft_seq_len, ft_seq_len, freqs.shape[-1]))
+        freqs_w = jnp.broadcast_to(freqs[None, :, :], (ft_seq_len, ft_seq_len, freqs.shape[-1]))
+        freqs = jnp.concatenate([freqs_h, freqs_w], axis=-1).reshape(-1, freqs.shape[-1])
 
+        cos = jnp.cos(freqs)
+        sin = jnp.sin(freqs)
         if self.num_cls_token > 0:
-            cos_pad = jnp.ones((self.num_cls_token, freqs.shape[-1]))
-            sin_pad = jnp.zeros((self.num_cls_token, freqs.shape[-1]))
-            self.freqs_cos = jnp.concatenate([cos_pad, jnp.cos(freqs)], axis=0)
-            self.freqs_sin = jnp.concatenate([sin_pad, jnp.sin(freqs)], axis=0)
-        else:
-            self.freqs_cos = jnp.cos(freqs)
-            self.freqs_sin = jnp.sin(freqs)
+            n_tokens, rot_dim = cos.shape
+            cos_pad = jnp.ones((self.num_cls_token, rot_dim), dtype=cos.dtype)
+            sin_pad = jnp.zeros((self.num_cls_token, rot_dim), dtype=sin.dtype)
+            cos = jnp.concatenate([cos_pad, cos], axis=0)
+            sin = jnp.concatenate([sin_pad, sin], axis=0)
+
+        self.freqs_cos = cos
+        self.freqs_sin = sin
 
     def __call__(self, t: jnp.ndarray) -> jnp.ndarray:
         # t: (B, heads, tokens, dim)
@@ -274,17 +285,22 @@ class JiTBlock(nn.Module):
 
 
 def _get_2d_sincos_pos_embed(embed_dim: int, grid_size: int) -> np.ndarray:
+    """Port of JiT's get_2d_sincos_pos_embed (util/model_util.py)."""
     grid_h = np.arange(grid_size, dtype=np.float32)
     grid_w = np.arange(grid_size, dtype=np.float32)
-    grid = np.meshgrid(grid_w, grid_h)
+    grid = np.meshgrid(grid_w, grid_h)  # w first
     grid = np.stack(grid, axis=0).reshape([2, 1, grid_size, grid_size])
+    return _get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
 
-    emb_h = _get_1d_sincos_pos_embed(embed_dim // 2, grid[0])
-    emb_w = _get_1d_sincos_pos_embed(embed_dim // 2, grid[1])
+
+def _get_2d_sincos_pos_embed_from_grid(embed_dim: int, grid: np.ndarray) -> np.ndarray:
+    assert embed_dim % 2 == 0
+    emb_h = _get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])
+    emb_w = _get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])
     return np.concatenate([emb_h, emb_w], axis=1)
 
 
-def _get_1d_sincos_pos_embed(embed_dim: int, pos: np.ndarray) -> np.ndarray:
+def _get_1d_sincos_pos_embed_from_grid(embed_dim: int, pos: np.ndarray) -> np.ndarray:
     assert embed_dim % 2 == 0
     omega = np.arange(embed_dim // 2, dtype=np.float64)
     omega /= embed_dim / 2.0

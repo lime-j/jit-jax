@@ -68,6 +68,7 @@ def _format_duration(seconds: float) -> str:
 @dataclass
 class TrainConfig:
     model: str = "JiT-B/16"
+    model_backend: str = "jax"
     img_size: int = 256
     batch_size: int = 128
     epochs: int = 200
@@ -135,7 +136,7 @@ def make_lr_schedule(config: TrainConfig, steps_per_epoch: int) -> Callable[[int
     return schedule
 
 
-def create_state(rng: jax.Array, config: TrainConfig, steps_per_epoch: int) -> TrainState:
+def _create_jax_model(rng: jax.Array, config: TrainConfig) -> tuple[dict, Callable, dict | None]:
     model_def = JiT_models[config.model](
         input_size=config.img_size,
         in_channels=3,
@@ -153,11 +154,75 @@ def create_state(rng: jax.Array, config: TrainConfig, steps_per_epoch: int) -> T
         train=True,
     )
     params = variables["params"]
+    return params, model_def.apply, None
+
+
+def _create_torchax_model(rng: jax.Array, config: TrainConfig) -> tuple[dict, Callable, dict]:
+    try:
+        import copy
+        import torch
+        import torchax
+    except ImportError as exc:
+        raise ImportError("torchax is required for --model_backend torchax") from exc
+
+    # torch.compile may trace with a backend that is incompatible with torchax.
+    original_compile = getattr(torch, "compile", None)
+    if original_compile is not None:
+        torch.compile = lambda fn, *args, **kwargs: fn
+    try:
+        from jit_jax import torch_model as torch_model_lib
+    finally:
+        if original_compile is not None:
+            torch.compile = original_compile
+
+    seed = int(jax.random.randint(rng, (), 0, 2**31 - 1))
+    torch.manual_seed(seed)
+    env = torchax.default_env()
+    env.manual_seed(seed)
+
+    model = torch_model_lib.JiT_models[config.model](
+        input_size=config.img_size,
+        in_channels=3,
+        num_classes=config.class_num,
+        attn_drop=config.attn_dropout,
+        proj_drop=config.proj_dropout,
+    )
+    model_eval = copy.deepcopy(model)
+    model_eval.eval()
+
+    params, jax_func_train = torchax.extract_jax(model, env=env)
+    _, jax_func_eval = torchax.extract_jax(model_eval, env=env)
+
+    param_mask = {name: bool(param.requires_grad) for name, param in model.named_parameters()}
+    for name, _ in model.named_buffers():
+        param_mask[name] = False
+    for name in params:
+        param_mask.setdefault(name, False)
+
+    def apply_fn(variables, x, t, y, train: bool, rngs=None):
+        x_nchw = jnp.transpose(x, (0, 3, 1, 2))
+        jax_func = jax_func_train if train else jax_func_eval
+        out = jax_func(variables["params"], (x_nchw, t, y))
+        return jnp.transpose(out, (0, 2, 3, 1))
+
+    return params, apply_fn, param_mask
+
+
+def create_state(rng: jax.Array, config: TrainConfig, steps_per_epoch: int) -> TrainState:
+    if config.model_backend == "torchax":
+        params, apply_fn, param_mask = _create_torchax_model(rng, config)
+    elif config.model_backend == "jax":
+        params, apply_fn, param_mask = _create_jax_model(rng, config)
+    else:
+        raise ValueError(f"Unknown model_backend {config.model_backend}")
 
     lr_schedule = make_lr_schedule(config, steps_per_epoch)
-    tx = optax.adamw(learning_rate=lr_schedule, b1=0.9, b2=0.95, weight_decay=config.weight_decay)
+    if param_mask is not None:
+        tx = optax.adamw(learning_rate=lr_schedule, b1=0.9, b2=0.95, weight_decay=config.weight_decay, mask=param_mask)
+    else:
+        tx = optax.adamw(learning_rate=lr_schedule, b1=0.9, b2=0.95, weight_decay=config.weight_decay)
 
-    state = TrainState.create(apply_fn=model_def.apply, params=params, tx=tx, ema1=params, ema2=params)
+    state = TrainState.create(apply_fn=apply_fn, params=params, tx=tx, ema1=params, ema2=params)
     return state
 
 
@@ -281,23 +346,60 @@ def make_eval_step(config: TrainConfig) -> Callable:
     return eval_step
 
 
-def save_checkpoint_if_needed(state: TrainState, save_dir: str, step: int) -> None:
+def _broadcast_float(value: float) -> float:
+    try:
+        from jax.experimental import multihost_utils
+    except ImportError:
+        return value
+    value = jnp.asarray(value, dtype=jnp.float32)
+    value = multihost_utils.broadcast_one_to_all(value)
+    return float(jax.device_get(value))
+
+
+def save_checkpoint_if_needed(
+    state: TrainState,
+    save_dir: str,
+    *,
+    save_last: bool,
+    save_best: bool,
+    metadata: dict | None = None,
+) -> None:
     save_dir = os.path.abspath(save_dir)
     os.makedirs(save_dir, exist_ok=True)
     state_to_save = jax.device_get(jax_utils.unreplicate(state))
-    ckpt_dir = ocp.utils.get_save_directory(step, save_dir)
-    checkpointer.save(ckpt_dir, state_to_save)
+    if save_last:
+        last_dir = os.path.join(save_dir, "last")
+        checkpointer.save(last_dir, state_to_save, force=True, custom_metadata=metadata)
+    if save_best:
+        best_dir = os.path.join(save_dir, "best")
+        checkpointer.save(best_dir, state_to_save, force=True, custom_metadata=metadata)
 
 
-def restore_checkpoint_if_available(state: TrainState, save_dir: str) -> tuple[TrainState, int | None]:
+def restore_checkpoint_if_available(state: TrainState, save_dir: str) -> tuple[TrainState, str | None]:
     save_dir = os.path.abspath(save_dir)
+    if os.path.isdir(save_dir):
+        try:
+            ocp.metadata.get_step_metadata(save_dir)
+        except Exception:
+            pass
+        else:
+            state = checkpointer.restore(save_dir, state)
+            return state, save_dir
+    last_dir = os.path.join(save_dir, "last")
+    if os.path.isdir(last_dir):
+        state = checkpointer.restore(last_dir, state)
+        return state, last_dir
+    best_dir = os.path.join(save_dir, "best")
+    if os.path.isdir(best_dir):
+        state = checkpointer.restore(best_dir, state)
+        return state, best_dir
     steps = ocp.utils.checkpoint_steps(save_dir)
     if not steps:
         return state, None
     latest_step = max(steps)
     ckpt_dir = ocp.utils.get_save_directory(latest_step, save_dir)
     state = checkpointer.restore(ckpt_dir, state)
-    return state, latest_step
+    return state, str(ckpt_dir)
 
 
 def train_and_maybe_sample(config: TrainConfig) -> None:
@@ -312,10 +414,20 @@ def train_and_maybe_sample(config: TrainConfig) -> None:
     rng = jax.random.fold_in(rng, jax.process_index())
     rng, init_rng = jax.random.split(rng)
     state = create_state(init_rng, config, steps_per_epoch)
-    state, restored_step = restore_checkpoint_if_available(state, ckpt_dir)
-    if restored_step is not None and jax.process_index() == 0:
-        print(f"Restored checkpoint step {restored_step} from {ckpt_dir}")
+    state, restored_path = restore_checkpoint_if_available(state, ckpt_dir)
+    if restored_path is not None and jax.process_index() == 0:
+        print(f"Restored checkpoint from {restored_path}")
     state = jax_utils.replicate(state)
+
+    best_val_loss = float("inf")
+    best_dir = os.path.join(os.path.abspath(ckpt_dir), "best")
+    if jax.process_index() == 0 and os.path.isdir(best_dir):
+        try:
+            best_meta = ocp.metadata.get_step_metadata(best_dir)
+            best_val_loss = float(best_meta.custom_metadata.get("val_loss", best_val_loss))
+        except Exception:
+            best_val_loss = float("inf")
+    best_val_loss = _broadcast_float(best_val_loss if jax.process_index() == 0 else 0.0)
 
     pipeline = DataPipeline(batch_size=config.batch_size, image_size=config.img_size, seed=config.seed)
     pipeline_val = DataPipeline(batch_size=config.batch_size, image_size=config.img_size, seed=config.seed)
@@ -367,7 +479,7 @@ def train_and_maybe_sample(config: TrainConfig) -> None:
             if jax.process_index() == 0:
                 train_loss_acc += float(jax.device_get(metrics["loss"])[0])
                 train_batches += 1
-
+            break
         train_loss_avg = train_loss_acc / max(train_batches, 1) if jax.process_index() == 0 else None
 
         # Validation loss
@@ -399,7 +511,19 @@ def train_and_maybe_sample(config: TrainConfig) -> None:
                     step=(epoch + 1) * steps_per_epoch,
                 )
 
-        save_checkpoint_if_needed(state, ckpt_dir, epoch)
+        val_loss_avg = _broadcast_float(val_loss_avg if jax.process_index() == 0 else 0.0)
+        train_loss_avg_value = _broadcast_float(train_loss_avg if jax.process_index() == 0 else 0.0)
+        save_best = val_loss_avg < best_val_loss
+        if save_best:
+            best_val_loss = val_loss_avg
+
+        save_checkpoint_if_needed(
+            state,
+            ckpt_dir,
+            save_last=True,
+            save_best=save_best,
+            metadata={"epoch": epoch, "train_loss": train_loss_avg_value, "val_loss": val_loss_avg},
+        )
     if wandb_run:
         wandb_run.finish()
 
@@ -407,6 +531,7 @@ def train_and_maybe_sample(config: TrainConfig) -> None:
 def parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser(description="Train JiT in JAX (Flax + Optax).")
     parser.add_argument("--model", type=str, default="JiT-B/16")
+    parser.add_argument("--model_backend", type=str, default="jax", choices=["jax", "torchax"])
     parser.add_argument("--img_size", type=int, default=256)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=200)

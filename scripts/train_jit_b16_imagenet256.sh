@@ -25,4 +25,7 @@ python train.py \
   --noise_scale 1.0 \
   --sampling_method heun --num_sampling_steps 50 \
   --cfg 2.9 --interval_min 0.1 --interval_max 1.0 \
-  --save_dir "${SAVE_DIR}"
+  --save_dir "${SAVE_DIR}" \
+  --model_backend 'torchax' --use_wandb \
+  --wandb_project 'JiT-Jax-Torchax' \
+  --wandb_run_name 'JiT-B16-ImageNet256-Torchax'
