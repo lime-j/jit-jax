@@ -479,7 +479,6 @@ def train_and_maybe_sample(config: TrainConfig) -> None:
             if jax.process_index() == 0:
                 train_loss_acc += float(jax.device_get(metrics["loss"])[0])
                 train_batches += 1
-            break
         train_loss_avg = train_loss_acc / max(train_batches, 1) if jax.process_index() == 0 else None
 
         # Validation loss
